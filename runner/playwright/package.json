@@ -1,0 +1,14 @@
+{
+  "name": "automated-test-playwright-runner",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "run": "node src/cli.mjs"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.45.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  },
+  "devDependencies": {}
+}

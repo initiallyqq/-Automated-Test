@@ -1,0 +1,8 @@
+.autotest/
+.cache/
+.gocache/
+artifacts/
+node_modules/
+dist/
+*.log
+.env.local

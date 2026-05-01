@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Notes App</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }
+.container { max-width: 720px; margin: 0 auto; padding: 24px 16px; }
+h1 { font-size: 1.6rem; margin-bottom: 20px; color: #1a1a1a; }
+
+.form-card { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+.form-card h2 { font-size: 1.1rem; margin-bottom: 12px; }
+.form-group { margin-bottom: 12px; }
+.form-group label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 4px; color: #555; }
+.form-group input, .form-group textarea, .form-group select { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.95rem; font-family: inherit; }
+.form-group textarea { min-height: 60px; resize: vertical; }
+.btn { display: inline-flex; align-items: center; justify-content: center; padding: 8px 18px; border: none; border-radius: 6px; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+.btn-primary { background: #2563eb; color: #fff; }
+.btn-primary:hover { background: #1d4ed8; }
+.btn-danger { background: #dc2626; color: #fff; }
+.btn-danger:hover { background: #b91c1c; }
+.btn-sm { padding: 4px 12px; font-size: 0.8rem; }
+
+.note-list { list-style: none; }
+.note-item { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.note-body { flex: 1; min-width: 0; }
+.note-title { font-size: 1.05rem; font-weight: 700; margin-bottom: 4px; }
+.note-content { font-size: 0.9rem; color: #666; white-space: pre-wrap; word-break: break-word; }
+.note-meta { font-size: 0.75rem; color: #999; margin-top: 6px; }
+.note-actions { display: flex; gap: 6px; flex-shrink: 0; }
+
+.badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+.badge-todo { background: #fef3c7; color: #92400e; }
+.badge-in-progress { background: #dbeafe; color: #1e40af; }
+.badge-done { background: #d1fae5; color: #065f46; }
+
+.empty { text-align: center; padding: 40px 16px; color: #999; }
+.error-banner { background: #fee2e2; color: #991b1b; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Notes</h1>
+
+  <div id="error" class="error-banner" style="display:none"></div>
+
+  <div class="form-card">
+    <h2>Add Note</h2>
+    <form id="add-form">
+      <div class="form-group">
+        <label for="title">Title</label>
+        <input type="text" id="title" name="title" required maxlength="200" placeholder="Note title">
+      </div>
+      <div class="form-group">
+        <label for="content">Content</label>
+        <textarea id="content" name="content" rows="2" placeholder="Note content (optional)"></textarea>
+      </div>
+      <div class="form-group">
+        <label for="status">Status</label>
+        <select id="status" name="status">
+          <option value="todo">Todo</option>
+          <option value="in-progress">In Progress</option>
+          <option value="done">Done</option>
+        </select>
+      </div>
+      <button type="submit" class="btn btn-primary">Add Note</button>
+    </form>
+  </div>
+
+  <ul id="note-list" class="note-list"></ul>
+</div>
+
+<script>
+const API = '/api/notes';
+
+function showError(msg) {
+  const el = document.getElementById('error');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => { el.style.display = 'none'; }, 4000);
+}
+
+function badgeClass(status) {
+  return 'badge badge-' + status;
+}
+
+function statusLabel(s) {
+  return { 'todo': 'Todo', 'in-progress': 'In Progress', 'done': 'Done' }[s] || s;
+}
+
+function renderNote(n) {
+  return `
+    <li class="note-item" data-id="${n.id}">
+      <div class="note-body">
+        <div class="note-title">${esc(n.title)}</div>
+        ${n.content ? `<div class="note-content">${esc(n.content)}</div>` : ''}
+        <div class="note-meta">
+          <span class="${badgeClass(n.status)}">${statusLabel(n.status)}</span>
+          &middot; ${new Date(n.created_at).toLocaleString('zh-CN')}
+        </div>
+      </div>
+      <div class="note-actions">
+        <button class="btn btn-primary btn-sm edit-btn" data-id="${n.id}">Edit</button>
+        <button class="btn btn-danger btn-sm delete-btn" data-id="${n.id}">Delete</button>
+      </div>
+    </li>`;
+}
+
+function esc(s) {
+  const el = document.createElement('span');
+  el.textContent = s;
+  return el.innerHTML;
+}
+
+async function loadNotes() {
+  const list = document.getElementById('note-list');
+  try {
+    const res = await fetch(API);
+    if (!res.ok) throw new Error('Failed to load notes');
+    const notes = await res.json();
+    if (notes.length === 0) {
+      list.innerHTML = '<li class="empty">No notes yet. Add one above!</li>';
+    } else {
+      list.innerHTML = notes.map(renderNote).join('');
+    }
+  } catch (e) {
+    showError(e.message);
+  }
+}
+
+document.getElementById('add-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const data = {
+    title: form.title.value.trim(),
+    content: form.content.value.trim(),
+    status: form.status.value
+  };
+  if (!data.title) return showError('Title is required');
+
+  try {
+    const res = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Create failed');
+    }
+    form.reset();
+    await loadNotes();
+  } catch (err) {
+    showError(err.message);
+  }
+});
+
+document.getElementById('note-list').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const id = btn.dataset.id;
+
+  if (btn.classList.contains('delete-btn')) {
+    if (!confirm('Delete this note?')) return;
+    try {
+      const res = await fetch(API + '/' + id, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Delete failed');
+      await loadNotes();
+    } catch (err) {
+      showError(err.message);
+    }
+  }
+
+  if (btn.classList.contains('edit-btn')) {
+    const newTitle = prompt('New title:');
+    if (newTitle === null) return;
+    const newStatus = prompt('New status (todo / in-progress / done):', 'todo');
+    if (newStatus === null) return;
+    try {
+      const res = await fetch(API + '/' + id, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: newTitle.trim(), status: newStatus.trim() || 'todo' })
+      });
+      if (!res.ok) throw new Error('Update failed');
+      await loadNotes();
+    } catch (err) {
+      showError(err.message);
+    }
+  }
+});
+
+loadNotes();
+</script>
+</body>
+</html>
