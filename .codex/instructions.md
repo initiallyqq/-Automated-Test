@@ -96,3 +96,10 @@ D:\mygo\自动化测试系统\-Automated-Test
 - Metadata database: SQLite
 - Entry points: CLI/API
 - Test patches: auto-apply after Review Guard allows them
+
+## 5. Shell preference
+
+- Prefer Git Bash / `bash` for future terminal commands in this repository.
+- On this machine, use `D:\Git\bin\bash.exe -lc '<command>'` when invoking shell commands.
+- Do not use PowerShell for normal development, verification, or full-chain runs unless Bash is unavailable or a Windows-only command is explicitly required.
+- When writing examples or project commands, prefer Bash syntax over PowerShell syntax.

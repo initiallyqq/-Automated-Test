@@ -78,6 +78,64 @@ func TestRepositorySavesDiagnosisAndPatch(t *testing.T) {
 	}
 }
 
+func TestRepositorySavesSameArtifactIDAcrossTasks(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "autotest.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := NewRepository(db)
+	if err := repo.UpsertProject(ctx, "project-1", "Project 1", ".", "fullstack"); err != nil {
+		t.Fatal(err)
+	}
+	for _, taskID := range []string{"task-1", "task-2"} {
+		state := workflow.NewState(taskID, "project-1", 2)
+		if err := repo.SaveTask(ctx, state); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.SaveTestArtifacts(ctx, taskID, []workflow.TestArtifact{{
+			ID:          "artifact-e2e-playwright-config-ts",
+			ScenarioID:  "config",
+			Type:        "config",
+			Path:        "e2e/playwright.config.ts",
+			Language:    "typescript",
+			ContentHash: "same-content",
+		}}); err != nil {
+			t.Fatalf("save artifacts for %s: %v", taskID, err)
+		}
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM test_artifacts`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected artifacts for both tasks, got %d", count)
+	}
+
+	if err := repo.SaveTestArtifacts(ctx, "task-2", []workflow.TestArtifact{{
+		ID:          "artifact-e2e-playwright-config-ts",
+		ScenarioID:  "config",
+		Type:        "config",
+		Path:        "e2e/playwright.config.ts",
+		Language:    "typescript",
+		ContentHash: "updated-content",
+	}}); err != nil {
+		t.Fatalf("resave artifacts for task-2: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM test_artifacts`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected resave to replace only task-2 artifacts, got %d", count)
+	}
+}
+
 func TestRepositorySavesAndReadsAgentRuns(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "autotest.db"))

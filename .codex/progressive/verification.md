@@ -12,15 +12,15 @@
 
 优先使用仓库内 Go 缓存：
 
-```powershell
-$env:GOCACHE=(Join-Path (Get-Location) '.cache\go-build')
-$env:GOMODCACHE=(Join-Path (Get-Location) '.cache\gomod')
-$env:GOTELEMETRY='off'
+```bash
+export GOCACHE="$(pwd)/.cache/go-build"
+export GOMODCACHE="$(pwd)/.cache/gomod"
+export GOTELEMETRY=off
 ```
 
 ## 推荐验证顺序
 
-```powershell
+```bash
 go mod tidy
 go test ./internal/infra/agentruntime ./internal/app/orchestrator
 go test ./...

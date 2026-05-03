@@ -1,0 +1,8 @@
+base_url: http://127.0.0.1:3102
+
+commands:
+  start: "PORT=3102 DB_PATH=test-app-3102.db go run ."
+  reset: "rm -f test-app-3102.db"
+
+metadata:
+  purpose: sample target app for full-chain validation

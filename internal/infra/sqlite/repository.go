@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"automated-test/internal/domain/workflow"
@@ -236,7 +237,7 @@ func (r *Repository) SaveTestArtifacts(ctx context.Context, taskID string, artif
 		return err
 	}
 	for _, artifact := range artifacts {
-		id := artifact.ID
+		id := testArtifactRowID(taskID, artifact.ID)
 		if id == "" {
 			id = fmt.Sprintf("artifact_%d", time.Now().UnixNano())
 		}
@@ -256,6 +257,18 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?);`,
 		}
 	}
 	return nil
+}
+
+func testArtifactRowID(taskID, artifactID string) string {
+	taskID = strings.TrimSpace(taskID)
+	artifactID = strings.TrimSpace(artifactID)
+	if taskID == "" {
+		return artifactID
+	}
+	if artifactID == "" {
+		return ""
+	}
+	return taskID + ":" + artifactID
 }
 
 func (r *Repository) SaveExecution(ctx context.Context, taskID string, result workflow.ExecutionResult) error {

@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -25,24 +29,36 @@ import (
 )
 
 type Options struct {
-	Config        config.Config
-	Repository    Repository
-	JSONGenerator JSONGenerator
-	AgentExecutor agentruntime.AgentExecutor
-	ToolRegistry  *agentruntime.Registry
-	ProgressChan  chan<- ProgressEvent
+	Config              config.Config
+	Repository          Repository
+	JSONGenerator       JSONGenerator
+	AgentExecutor       agentruntime.AgentExecutor
+	ToolRegistry        *agentruntime.Registry
+	ProgressChan        chan<- ProgressEvent
+	TargetCommandRunner TargetCommandRunner
 }
 
 type Orchestrator struct {
-	config        config.Config
-	repo          Repository
-	agentExecutor agentruntime.AgentExecutor
-	toolRegistry  *agentruntime.Registry
-	progressChan  chan<- ProgressEvent
+	config              config.Config
+	repo                Repository
+	agentExecutor       agentruntime.AgentExecutor
+	toolRegistry        *agentruntime.Registry
+	progressChan        chan<- ProgressEvent
+	targetCommandRunner TargetCommandRunner
+	targetStartCancel   context.CancelFunc
+	targetStartPID      int
+	targetStarted       bool
 }
 
 type JSONGenerator interface {
 	GenerateJSON(ctx context.Context, prompt string, schema any) ([]byte, error)
+}
+
+type TargetCommandRunner func(ctx context.Context, name, command, workdir string) (TargetCommandResult, error)
+
+type TargetCommandResult struct {
+	Stdout string
+	Stderr string
 }
 
 type Repository interface {
@@ -57,15 +73,16 @@ type Repository interface {
 }
 
 type RunRequest struct {
-	ProjectID             string `json:"projectId"`
-	RepoPath              string `json:"repoPath"`
-	BaseURL               string `json:"baseUrl,omitempty"`
-	AutoApplyPatch        *bool  `json:"autoApplyPatch,omitempty"`
-	UseGraph              bool   `json:"useGraph,omitempty"`
-	Headed                bool   `json:"headed,omitempty"`
-	Visual                bool   `json:"visual,omitempty"`
-	SlowMoMS              int    `json:"slowMoMs,omitempty"`
-	ForceExecutionFailure bool   `json:"forceExecutionFailure,omitempty"`
+	ProjectID             string               `json:"projectId"`
+	RepoPath              string               `json:"repoPath"`
+	BaseURL               string               `json:"baseUrl,omitempty"`
+	TargetConfig          *config.TargetConfig `json:"targetConfig,omitempty"`
+	AutoApplyPatch        *bool                `json:"autoApplyPatch,omitempty"`
+	UseGraph              bool                 `json:"useGraph,omitempty"`
+	Headed                bool                 `json:"headed,omitempty"`
+	Visual                bool                 `json:"visual,omitempty"`
+	SlowMoMS              int                  `json:"slowMoMs,omitempty"`
+	ForceExecutionFailure bool                 `json:"forceExecutionFailure,omitempty"`
 }
 
 type RunResult struct {
@@ -103,11 +120,12 @@ func New(opts Options) *Orchestrator {
 	toolRegistry := defaultToolRegistry(opts.ToolRegistry)
 	generator := defaultJSONGenerator(opts.Config, opts.JSONGenerator)
 	return &Orchestrator{
-		config:        opts.Config,
-		repo:          opts.Repository,
-		agentExecutor: defaultAgentExecutor(opts.AgentExecutor, generator, toolRegistry),
-		toolRegistry:  toolRegistry,
-		progressChan:  opts.ProgressChan,
+		config:              opts.Config,
+		repo:                opts.Repository,
+		agentExecutor:       defaultAgentExecutor(opts.AgentExecutor, generator, toolRegistry),
+		toolRegistry:        toolRegistry,
+		progressChan:        opts.ProgressChan,
+		targetCommandRunner: defaultTargetCommandRunner(opts.TargetCommandRunner),
 	}
 }
 
@@ -150,7 +168,20 @@ func defaultJSONGenerator(cfg config.Config, provided JSONGenerator) JSONGenerat
 	return client
 }
 
+func defaultTargetCommandRunner(provided TargetCommandRunner) TargetCommandRunner {
+	if provided != nil {
+		return provided
+	}
+	return runTargetCommand
+}
+
 func (o *Orchestrator) Run(ctx context.Context, req RunRequest) (RunResult, error) {
+	var err error
+	req, err = o.prepareRunRequest(req)
+	if err != nil {
+		return RunResult{}, err
+	}
+	defer o.stopTargetApp()
 	taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
 	state := workflow.NewState(taskID, req.ProjectID, o.config.Patch.MaxTestFixRetry)
 	state.RepoVersion = "local"
@@ -217,6 +248,29 @@ func (o *Orchestrator) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		Data:   state,
 	})
 	return RunResult{TaskID: taskID, Phase: state.Phase, Status: state.Status, State: state}, nil
+}
+
+func (o *Orchestrator) prepareRunRequest(req RunRequest) (RunRequest, error) {
+	if strings.TrimSpace(req.RepoPath) == "" {
+		req.RepoPath = "."
+	}
+	if req.TargetConfig != nil {
+		if strings.TrimSpace(req.BaseURL) == "" {
+			req.BaseURL = req.TargetConfig.BaseURL
+		}
+		return req, nil
+	}
+	targetCfg, _, found, err := config.LoadTargetConfig(req.RepoPath)
+	if err != nil {
+		return req, err
+	}
+	if found {
+		req.TargetConfig = &targetCfg
+		if strings.TrimSpace(req.BaseURL) == "" {
+			req.BaseURL = targetCfg.BaseURL
+		}
+	}
+	return req, nil
 }
 
 func (o *Orchestrator) runFailureBranch(ctx context.Context, state *workflow.State, req RunRequest) error {
@@ -855,6 +909,9 @@ func (o *Orchestrator) testExecution(ctx context.Context, state *workflow.State,
 	state.Phase = workflow.PhaseTestExecution
 	state.Status = workflow.StatusRunning
 	o.emitPhase(state.TaskID, state.Phase, state.Status, "running playwright tests")
+	if err := o.prepareTargetEnvironment(ctx, state, req); err != nil {
+		return err
+	}
 	outputDir := filepath.Join(o.config.Artifacts.Root, "projects", state.ProjectID, "executions", state.TaskID)
 	testWorkspace, err := o.ensureTestWorkspace(state)
 	if err != nil {
@@ -913,6 +970,222 @@ func (o *Orchestrator) testExecution(ctx context.Context, state *workflow.State,
 		return nil
 	}
 	return err
+}
+
+func (o *Orchestrator) prepareTargetEnvironment(ctx context.Context, state *workflow.State, req RunRequest) error {
+	if req.TargetConfig == nil {
+		return nil
+	}
+	if strings.TrimSpace(req.TargetConfig.Commands.Reset) != "" {
+		if err := o.runTargetHook(ctx, state, req, "reset", req.TargetConfig.Commands.Reset); err != nil {
+			return err
+		}
+	}
+	if err := o.ensureTargetAppStarted(ctx, state, req); err != nil {
+		return err
+	}
+	if strings.TrimSpace(req.TargetConfig.Commands.Seed) != "" {
+		if err := o.runTargetHook(ctx, state, req, "seed", req.TargetConfig.Commands.Seed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *Orchestrator) ensureTargetAppStarted(ctx context.Context, state *workflow.State, req RunRequest) error {
+	if req.TargetConfig == nil || strings.TrimSpace(req.TargetConfig.Commands.Start) == "" {
+		return nil
+	}
+	if o.targetStarted {
+		return nil
+	}
+	workdir, err := filepath.Abs(firstNonEmpty(req.RepoPath, "."))
+	if err != nil {
+		return err
+	}
+	command := req.TargetConfig.Commands.Start
+	o.emitProgress(ProgressEvent{
+		Type:    ProgressExec,
+		TaskID:  state.TaskID,
+		Phase:   string(state.Phase),
+		Status:  string(state.Status),
+		Message: "starting target application",
+		Data: map[string]string{
+			"command": command,
+			"workdir": workdir,
+			"baseUrl": req.BaseURL,
+		},
+	})
+
+	startCtx, cancel := context.WithCancel(context.Background())
+	cmd := shellCommand(startCtx, command)
+	cmd.Dir = workdir
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return err
+	}
+	o.targetStartCancel = cancel
+	o.targetStartPID = cmd.Process.Pid
+	o.targetStarted = true
+	go drainTargetOutput(stdout)
+	go drainTargetOutput(stderr)
+
+	if strings.TrimSpace(req.BaseURL) == "" {
+		return nil
+	}
+	if err := waitForBaseURL(ctx, req.BaseURL, 30*time.Second); err != nil {
+		o.stopTargetApp()
+		return err
+	}
+	o.emitProgress(ProgressEvent{
+		Type:    ProgressExec,
+		TaskID:  state.TaskID,
+		Phase:   string(state.Phase),
+		Status:  string(state.Status),
+		Message: "target application is ready",
+		Data:    map[string]string{"baseUrl": req.BaseURL},
+	})
+	return nil
+}
+
+func drainTargetOutput(reader io.Reader) {
+	_, _ = io.Copy(io.Discard, reader)
+}
+
+func (o *Orchestrator) stopTargetApp() {
+	if runtime.GOOS == "windows" && o.targetStartPID > 0 {
+		_ = exec.Command("taskkill", "/PID", fmt.Sprint(o.targetStartPID), "/T", "/F").Run()
+	}
+	if o.targetStartCancel != nil {
+		o.targetStartCancel()
+		o.targetStartCancel = nil
+	}
+	o.targetStartPID = 0
+	o.targetStarted = false
+}
+
+func waitForBaseURL(ctx context.Context, baseURL string, timeout time.Duration) error {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 2 * time.Second}
+	var lastErr error
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode < 500 {
+				return nil
+			}
+			lastErr = fmt.Errorf("base url returned status %d", resp.StatusCode)
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("target application did not become ready at %s: %w", baseURL, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (o *Orchestrator) runTargetHook(ctx context.Context, state *workflow.State, req RunRequest, name, command string) error {
+	workdir, err := filepath.Abs(firstNonEmpty(req.RepoPath, "."))
+	if err != nil {
+		return err
+	}
+	o.emitProgress(ProgressEvent{
+		Type:    ProgressExec,
+		TaskID:  state.TaskID,
+		Phase:   string(state.Phase),
+		Status:  string(state.Status),
+		Message: "running target " + name + " command",
+		Data: map[string]string{
+			"name":    name,
+			"command": command,
+			"workdir": workdir,
+		},
+	})
+	result, err := o.targetCommandRunner(ctx, name, command, workdir)
+	if result.Stdout != "" {
+		o.emitProgress(ProgressEvent{
+			Type:    ProgressExec,
+			TaskID:  state.TaskID,
+			Phase:   string(state.Phase),
+			Status:  string(state.Status),
+			Message: hookOutputSnippet(result.Stdout),
+			Data:    map[string]string{"stream": "stdout", "hook": name},
+		})
+	}
+	if result.Stderr != "" {
+		o.emitProgress(ProgressEvent{
+			Type:    ProgressExec,
+			TaskID:  state.TaskID,
+			Phase:   string(state.Phase),
+			Status:  string(state.Status),
+			Message: hookOutputSnippet(result.Stderr),
+			Data:    map[string]string{"stream": "stderr", "hook": name},
+		})
+	}
+	if err != nil {
+		return fmt.Errorf("target %s command failed: %w", name, err)
+	}
+	return nil
+}
+
+func runTargetCommand(ctx context.Context, _, command, workdir string) (TargetCommandResult, error) {
+	cmd := shellCommand(ctx, command)
+	cmd.Dir = workdir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return TargetCommandResult{Stderr: string(output)}, err
+	}
+	return TargetCommandResult{Stdout: string(output)}, nil
+}
+
+func shellCommand(ctx context.Context, command string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		for _, path := range []string{
+			`D:\Git\bin\bash.exe`,
+			`D:\Git\usr\bin\bash.exe`,
+		} {
+			if _, err := os.Stat(path); err == nil {
+				return exec.CommandContext(ctx, path, "-lc", command)
+			}
+		}
+	}
+	if _, err := exec.LookPath("bash"); err == nil {
+		return exec.CommandContext(ctx, "bash", "-lc", command)
+	}
+	return exec.CommandContext(ctx, "sh", "-c", command)
+}
+
+func hookOutputSnippet(output string) string {
+	output = strings.TrimSpace(output)
+	const limit = 4000
+	if len(output) <= limit {
+		return output
+	}
+	return output[:limit] + "\n...[truncated]"
 }
 
 func (o *Orchestrator) failureDiagnosis(ctx context.Context, state *workflow.State, _ RunRequest) error {
@@ -1562,6 +1835,9 @@ func (o *Orchestrator) reRun(ctx context.Context, state *workflow.State, req Run
 	state.Status = workflow.StatusRunning
 	state.RetryState.ExecutionRetryCount++
 	o.emitPhase(state.TaskID, state.Phase, state.Status, "re-running tests")
+	if err := o.prepareTargetEnvironment(ctx, state, req); err != nil {
+		return err
+	}
 	outputDir := filepath.Join(o.config.Artifacts.Root, "projects", state.ProjectID, "executions", state.TaskID+"-rerun")
 	testWorkspace, err := o.ensureTestWorkspace(state)
 	if err != nil {

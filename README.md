@@ -2,11 +2,15 @@
 
 Go + `trpc-agent-go` + Playwright 自动化测试系统原型。
 
-## 当前状态
+## 当前状态与可用性边界
 
-项目已度过骨架阶段。MVP 工作流可以扫描任意目标应用代码仓库、通过 Agent 运行时规划测试场景、生成隔离的 Playwright 冒烟测试用例、执行测试、诊断测试失败、生成测试补丁、通过 Review Guard 审查、应用补丁并重新运行测试。
+项目已度过骨架阶段。MVP 工作流可以扫描目标应用代码仓库、通过 Agent 运行时规划测试场景、生成隔离的 Playwright 冒烟测试用例、执行测试、诊断测试失败、生成测试补丁、通过 Review Guard 审查、应用补丁并重新运行测试。
 
-`test-app/` 只是一个可本地启动的样例目标应用，用于验证端到端链路。系统核心能力不依赖该目录；真实使用时应通过 `repoPath`、`baseUrl` 和目标应用自己的测试数据库/测试环境来运行。
+当前系统适合自动生成第一批 L0 / smoke E2E，用来发现页面白屏、路由错误、接口 5xx、基础 CRUD 断裂、生成用例不稳定等问题。它还不能承诺“任意项目即插即测并发现深层业务 bug”。深层业务缺陷通常需要目标项目提供明确的测试环境、登录方式、测试账号、种子数据、接口契约和业务断言规则。
+
+因此本项目的演进目标是：先把目标项目的环境配置和契约输入标准化，再逐步把弱断言（如 `status < 500`）升级为业务断言和主动 bug 探测。
+
+`test-app/` 只是一个可本地启动的样例目标应用，用于验证端到端链路。系统核心能力不依赖该目录；真实使用时应通过 `repoPath`、`baseUrl`、目标应用配置文件和目标应用自己的测试数据库/测试环境来运行。
 
 支持两种运行模式：
 - **线性模式**（默认）：`Orchestrator.Run()` 逐步执行流水线
@@ -65,9 +69,48 @@ TEST_EXECUTION (失败)
 
 ## 命令
 
+最短用法：在目标项目或当前仓库配置好 `.autotest.yaml` 后，直接运行：
+
+```bash
+go run ./cmd/autotest
+```
+
+编译成本地二进制后更短：
+
+```bash
+go build -o autotest.exe ./cmd/autotest
+./autotest
+```
+
+也可以用 `.env.local` 固定常用参数：
+
+```bash
+AUTOTEST_REPO_PATH=test-app
+AUTOTEST_WATCH=true
+AUTOTEST_GRAPH=false
+AUTOTEST_HEADED=false
+```
+
+支持的常用环境变量：
+
+```text
+AUTOTEST_PROJECT_ID
+AUTOTEST_REPO_PATH
+AUTOTEST_BASE_URL
+AUTOTEST_WATCH
+AUTOTEST_GRAPH
+AUTOTEST_HEADED
+AUTOTEST_VISUAL
+AUTOTEST_SLOW_MO_MS
+AUTOTEST_FORCE_FAIL
+```
+
+命令行参数仍然可用，并且优先级高于环境变量。
+
 ```bash
 go test ./...
 go run ./cmd/autotest tools
+go run ./cmd/autotest
 go run ./cmd/autotest run
 go run ./cmd/autotest run --repo-path . --base-url http://127.0.0.1:3000
 go run ./cmd/autotest run --watch true        # 实时进度流
@@ -85,11 +128,43 @@ go run ./cmd/server
 
 在 Windows 沙盒环境中，建议使用项目本地 Go 缓存：
 
-```powershell
-$env:GOCACHE=(Resolve-Path .gocache).Path
-$env:GOTELEMETRY='off'
+```bash
+export GOCACHE="$PWD/.gocache"
+export GOTELEMETRY=off
 go test ./...
 ```
+
+## 目标项目配置
+
+真实项目建议在目标仓库根目录提供 `.autotest.yaml` 或 `.autotest.yml`。CLI 会在 `--repo-path` 指向的目录中自动读取该文件；命令行传入的 `--base-url` 优先级高于配置文件。
+
+最小示例：
+
+```yaml
+base_url: http://127.0.0.1:3000
+
+commands:
+  start: npm run dev
+  seed: npm run test:seed
+  reset: npm run test:reset
+
+auth:
+  login_url: /login
+  username: demo@example.com
+  password_env: AUTOTEST_DEMO_PASSWORD
+
+safety:
+  blocked_endpoints:
+    - DELETE /api/users/*
+    - POST /api/payments/*
+
+assertions:
+  rules:
+    - created notes must be visible in the notes list
+    - unauthenticated users must receive 401 or be redirected to login
+```
+
+当前已支持读取 `base_url` 并把它用于生成的 Playwright 测试。每次执行前会按 `commands.reset`、`commands.start`、`commands.seed` 的顺序准备目标应用：先重置测试数据，再启动目标应用并等待 `base_url` 可访问，最后执行种子数据命令。流程结束后会停止由系统启动的进程；修复后的重跑也会重新执行 reset/seed。认证、安全黑名单和业务断言字段已作为稳定 schema 落地，后续会继续接入工作流。
 
 ## 目标应用与数据库语义
 
@@ -108,19 +183,18 @@ go test ./...
 
 如需完全重新跑一遍系统，可以删除运行产物和缓存：
 
-```powershell
-Remove-Item -Recurse -Force .autotest, artifacts, .gocache -ErrorAction SilentlyContinue
-Remove-Item -Force autotest.exe -ErrorAction SilentlyContinue
-Remove-Item -Force test-app/*.db -ErrorAction SilentlyContinue
+```bash
+rm -rf .autotest artifacts .gocache
+rm -f autotest.exe test-app/*.db
 ```
 
 这些文件会在后续初始化、构建或运行时重新生成。不要删除 `runner/playwright/package.json`、`go.mod`、`go.sum`、`cmd/`、`internal/` 等源码和依赖描述文件。
 
 ## Qwen 配置
 
-```powershell
-$env:QWEN_API_KEY='your-api-key'
-$env:QWEN_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+```bash
+export QWEN_API_KEY='your-api-key'
+export QWEN_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 ```
 
 `QWEN_BASE_URL` 在使用默认 DashScope OpenAI 兼容端点时可省略。
@@ -195,7 +269,10 @@ e2e/specs/          生成的冒烟测试用例
 
 ## 后续工作
 
-1. 确保真实 Playwright 重跑在生成的冒烟测试上稳定通过
-2. 优化多文件失败诊断和模板级补丁生成
-3. 在任务报告中汇总 Playwright trace、截图、stdout、stderr
-4. 完善 Graph 工作流层的 checkpoint 和中断恢复
+1. 目标项目配置：继续接入认证信息、安全黑名单和业务断言声明；当前已支持 `base_url`、`commands.start`、`commands.reset` 和 `commands.seed`。
+2. OpenAPI / Swagger 优先：当目标项目提供接口契约时，用契约生成更准确的 payload、状态码断言和响应 schema 校验。
+3. 认证与数据初始化：支持测试账号登录、storage state 复用、seed/reset 钩子，降低真实项目接入成本。
+4. 强断言升级：把 `status < 500` 逐步升级为创建后可查询、字段一致、非法输入返回 400、未授权返回 401/403 等业务断言。
+5. Bug-seeking 模式：增加空值、超长、非法枚举、越权访问、重复提交、删除后读取、分页边界等主动探测。
+6. 失败诊断与修复：继续优化多文件失败诊断、模板级补丁生成和 Review Guard 策略。
+7. 工作流可靠性：完善 Graph checkpoint、中断恢复和长任务续跑。

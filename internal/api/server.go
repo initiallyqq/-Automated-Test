@@ -127,6 +127,10 @@ func (s *Server) runTask(w http.ResponseWriter, r *http.Request) {
 	if req.RepoPath == "" {
 		req.RepoPath = "."
 	}
+	if err := applyTargetConfigDefaults(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	if req.Visual {
 		req.Headed = true
 		if req.SlowMoMS == 0 {
@@ -206,6 +210,11 @@ func (s *Server) streamTask(w http.ResponseWriter, r *http.Request) {
 			req.SlowMoMS = 700
 		}
 	}
+	if err := applyTargetConfigDefaults(&req); err != nil {
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+		flusher.Flush()
+		return
+	}
 	if req.Visual {
 		req.Headed = true
 		if req.SlowMoMS == 0 {
@@ -244,6 +253,20 @@ func (s *Server) streamTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func applyTargetConfigDefaults(req *orchestrator.RunRequest) error {
+	if req == nil || req.BaseURL != "" {
+		return nil
+	}
+	targetCfg, _, found, err := config.LoadTargetConfig(req.RepoPath)
+	if err != nil {
+		return err
+	}
+	if found {
+		req.BaseURL = targetCfg.BaseURL
+	}
+	return nil
 }
 
 func (s *Server) workflowGraph(w http.ResponseWriter, r *http.Request) {

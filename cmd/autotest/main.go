@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"automated-test/internal/api"
@@ -27,11 +28,13 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) < 2 {
-		printUsage()
-		return nil
+		return runWorkflow(ctx, args)
 	}
 
 	switch args[1] {
+	case "help", "--help", "-h":
+		printUsage()
+		return nil
 	case "init":
 		if err := config.WriteDefault(".autotest/config.yaml"); err != nil {
 			return err
@@ -44,96 +47,7 @@ func run(ctx context.Context, args []string) error {
 		fmt.Println("initialized .autotest/config.yaml and sqlite database")
 		return nil
 	case "run":
-		cfg := config.Default()
-		db, err := openDB(ctx, cfg)
-		if err != nil {
-			return err
-		}
-		defer db.Close()
-		useGraph := flagValue(args, "--graph") == "true"
-		useWatch := flagValue(args, "--watch") == "true"
-		useHeaded := flagValue(args, "--headed") == "true"
-		useVisual := flagValue(args, "--visual") == "true"
-		slowMoMS := intFlagValue(args, "--slow-mo", 0)
-		if useVisual {
-			useHeaded = true
-			if slowMoMS == 0 {
-				slowMoMS = 700
-			}
-		}
-		baseURL := flagValue(args, "--base-url")
-		repoPath := flagValue(args, "--repo-path")
-		if repoPath == "" {
-			repoPath = "."
-		}
-		taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
-		req := orchestrator.RunRequest{
-			ProjectID:             "local",
-			RepoPath:              repoPath,
-			Headed:                useHeaded,
-			Visual:                useVisual,
-			SlowMoMS:              slowMoMS,
-			BaseURL:               baseURL,
-			UseGraph:              useGraph,
-			ForceExecutionFailure: flagValue(args, "--force-fail") == "true",
-		}
-
-		if useWatch {
-			progressChan := make(chan orchestrator.ProgressEvent, 32)
-			gr, grErr := orchestrator.NewGraphRunner(orchestrator.Options{
-				Config: cfg, Repository: sqlite.NewRepository(db), ProgressChan: progressChan,
-			})
-			if grErr != nil {
-				return grErr
-			}
-			go func() {
-				gr.Run(ctx, req, taskID)
-				close(progressChan)
-			}()
-			track := map[string]time.Time{}
-			for evt := range progressChan {
-				switch evt.Type {
-				case orchestrator.ProgressPhase:
-					track[evt.Phase] = time.Now()
-					fmt.Printf("[%s] %s %s\n", evt.Phase, evt.Status, evt.Message)
-				case orchestrator.ProgressAgent:
-					if evt.Status == "RUNNING" {
-						fmt.Printf("  ⏳ %s...\n", evt.AgentName)
-					} else if evt.Status == "SUCCEEDED" {
-						fmt.Printf("  ✅ %s\n", evt.AgentName)
-					} else {
-						fmt.Printf("  ❌ %s: %s\n", evt.AgentName, evt.Message)
-					}
-				case orchestrator.ProgressExec:
-					fmt.Printf("  > %s\n", evt.Message)
-				case orchestrator.ProgressDone:
-					fmt.Printf("[DONE] status=%s\n", evt.Status)
-				case orchestrator.ProgressError:
-					fmt.Printf("[ERROR] %s\n", evt.Message)
-				}
-			}
-			return nil
-		}
-
-		if useGraph {
-			gr, grErr := orchestrator.NewGraphRunner(orchestrator.Options{Config: cfg, Repository: sqlite.NewRepository(db)})
-			if grErr != nil {
-				return grErr
-			}
-			state, runErr := gr.Run(ctx, req, taskID)
-			if runErr != nil {
-				return runErr
-			}
-			fmt.Printf("task=%s phase=%s status=%s (graph)\n", taskID, state.Phase, state.Status)
-			return nil
-		}
-		orch := orchestrator.New(orchestrator.Options{Config: cfg, Repository: sqlite.NewRepository(db)})
-		result, err := orch.Run(ctx, req)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("task=%s phase=%s status=%s\n", result.TaskID, result.Phase, result.Status)
-		return nil
+		return runWorkflow(ctx, args)
 	case "status":
 		taskID := flagValue(args, "--task")
 		if taskID == "" {
@@ -300,6 +214,7 @@ func printUsage() {
 	fmt.Print(`autotest
 
 Usage:
+  autotest                       Run tests using .autotest.yaml / AUTOTEST_* env
   autotest init                  Initialize local config
   autotest run                   Run MVP workflow for current repo
   autotest run --watch true      Run with live progress streaming
@@ -319,6 +234,106 @@ Usage:
 `)
 }
 
+func runWorkflow(ctx context.Context, args []string) error {
+	cfg := config.Default()
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	useGraph := boolSetting(args, "--graph", "AUTOTEST_GRAPH", false)
+	useWatch := boolSetting(args, "--watch", "AUTOTEST_WATCH", false)
+	useHeaded := boolSetting(args, "--headed", "AUTOTEST_HEADED", false)
+	useVisual := boolSetting(args, "--visual", "AUTOTEST_VISUAL", false)
+	slowMoMS := intSetting(args, "--slow-mo", "AUTOTEST_SLOW_MO_MS", 0)
+	if useVisual {
+		useHeaded = true
+		if slowMoMS == 0 {
+			slowMoMS = 700
+		}
+	}
+
+	repoPath := stringSetting(args, "--repo-path", "AUTOTEST_REPO_PATH", ".")
+	baseURL := stringSetting(args, "--base-url", "AUTOTEST_BASE_URL", "")
+	if baseURL == "" {
+		targetCfg, _, found, err := config.LoadTargetConfig(repoPath)
+		if err != nil {
+			return err
+		}
+		if found {
+			baseURL = targetCfg.BaseURL
+		}
+	}
+
+	taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
+	req := orchestrator.RunRequest{
+		ProjectID:             stringSetting(args, "--project-id", "AUTOTEST_PROJECT_ID", "local"),
+		RepoPath:              repoPath,
+		Headed:                useHeaded,
+		Visual:                useVisual,
+		SlowMoMS:              slowMoMS,
+		BaseURL:               baseURL,
+		UseGraph:              useGraph,
+		ForceExecutionFailure: boolSetting(args, "--force-fail", "AUTOTEST_FORCE_FAIL", false),
+	}
+
+	if useWatch {
+		progressChan := make(chan orchestrator.ProgressEvent, 32)
+		gr, grErr := orchestrator.NewGraphRunner(orchestrator.Options{
+			Config: cfg, Repository: sqlite.NewRepository(db), ProgressChan: progressChan,
+		})
+		if grErr != nil {
+			return grErr
+		}
+		go func() {
+			gr.Run(ctx, req, taskID)
+			close(progressChan)
+		}()
+		for evt := range progressChan {
+			switch evt.Type {
+			case orchestrator.ProgressPhase:
+				fmt.Printf("[%s] %s %s\n", evt.Phase, evt.Status, evt.Message)
+			case orchestrator.ProgressAgent:
+				if evt.Status == "RUNNING" {
+					fmt.Printf("  running %s...\n", evt.AgentName)
+				} else if evt.Status == "SUCCEEDED" {
+					fmt.Printf("  ok %s\n", evt.AgentName)
+				} else {
+					fmt.Printf("  failed %s: %s\n", evt.AgentName, evt.Message)
+				}
+			case orchestrator.ProgressExec:
+				fmt.Printf("  > %s\n", evt.Message)
+			case orchestrator.ProgressDone:
+				fmt.Printf("[DONE] status=%s\n", evt.Status)
+			case orchestrator.ProgressError:
+				fmt.Printf("[ERROR] %s\n", evt.Message)
+			}
+		}
+		return nil
+	}
+
+	if useGraph {
+		gr, grErr := orchestrator.NewGraphRunner(orchestrator.Options{Config: cfg, Repository: sqlite.NewRepository(db)})
+		if grErr != nil {
+			return grErr
+		}
+		state, runErr := gr.Run(ctx, req, taskID)
+		if runErr != nil {
+			return runErr
+		}
+		fmt.Printf("task=%s phase=%s status=%s (graph)\n", taskID, state.Phase, state.Status)
+		return nil
+	}
+	orch := orchestrator.New(orchestrator.Options{Config: cfg, Repository: sqlite.NewRepository(db)})
+	result, err := orch.Run(ctx, req)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("task=%s phase=%s status=%s\n", result.TaskID, result.Phase, result.Status)
+	return nil
+}
+
 func openDB(ctx context.Context, cfg config.Config) (*sqlite.DB, error) {
 	db, err := sqlite.Open(ctx, cfg.Database.DSN)
 	if err != nil {
@@ -331,6 +346,36 @@ func openDB(ctx context.Context, cfg config.Config) (*sqlite.DB, error) {
 	return db, nil
 }
 
+func stringSetting(args []string, flagName, envName, fallback string) string {
+	if value := flagValue(args, flagName); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func boolSetting(args []string, flagName, envName string, fallback bool) bool {
+	if value := flagValue(args, flagName); value != "" {
+		return parseBool(value, fallback)
+	}
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		return parseBool(value, fallback)
+	}
+	return fallback
+}
+
+func intSetting(args []string, flagName, envName string, fallback int) int {
+	if value := flagValue(args, flagName); value != "" {
+		return parseInt(value, fallback)
+	}
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		return parseInt(value, fallback)
+	}
+	return fallback
+}
+
 func flagValue(args []string, name string) string {
 	for i := 0; i < len(args)-1; i++ {
 		if args[i] == name {
@@ -340,14 +385,21 @@ func flagValue(args []string, name string) string {
 	return ""
 }
 
-func intFlagValue(args []string, name string, fallback int) int {
-	value := flagValue(args, name)
-	if value == "" {
-		return fallback
-	}
+func parseInt(value string, fallback int) int {
 	var parsed int
 	if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil {
 		return fallback
 	}
 	return parsed
+}
+
+func parseBool(value string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
 }

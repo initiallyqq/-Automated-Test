@@ -3,6 +3,7 @@ module automated-test
 go 1.25.0
 
 require (
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.48.2
 	trpc.group/trpc-go/trpc-agent-go v1.8.1
 )
@@ -38,7 +39,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240822170219-fc7c04adadcd // indirect
 	google.golang.org/grpc v1.65.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.70.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

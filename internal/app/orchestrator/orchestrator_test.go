@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,6 +156,83 @@ func TestOrchestratorUsesJSONGeneratorForScenarioPlanning(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertAgentRun(t, runs, "scenario.plan")
+}
+
+func TestOrchestratorRunsTargetResetAndSeedBeforeExecution(t *testing.T) {
+	projectRoot := makeTempProject(t)
+	cfg := testConfig(t)
+	cfg.Artifacts.Root = filepath.Join(t.TempDir(), "artifacts")
+	calls := []string{}
+	workdirs := []string{}
+
+	result, err := New(Options{
+		Config:        cfg,
+		JSONGenerator: scenarioGenerator(),
+		TargetCommandRunner: func(_ context.Context, name, command, workdir string) (TargetCommandResult, error) {
+			calls = append(calls, name+":"+command)
+			workdirs = append(workdirs, workdir)
+			return TargetCommandResult{Stdout: name + " ok"}, nil
+		},
+	}).Run(context.Background(), RunRequest{
+		ProjectID: "project-target-hooks",
+		RepoPath:  projectRoot,
+		TargetConfig: &config.TargetConfig{
+			Commands: config.TargetCommands{
+				Reset: "npm run test:reset",
+				Seed:  "npm run test:seed",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != workflow.StatusSucceeded {
+		t.Fatalf("expected succeeded, got %s", result.Status)
+	}
+	want := []string{"reset:npm run test:reset", "seed:npm run test:seed"}
+	if strings.Join(calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("expected target hooks %v, got %v", want, calls)
+	}
+	absProjectRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, workdir := range workdirs {
+		if workdir != absProjectRoot {
+			t.Fatalf("expected hook workdir %q, got %q", absProjectRoot, workdir)
+		}
+	}
+}
+
+func TestOrchestratorStartsTargetAppBeforeExecution(t *testing.T) {
+	projectRoot := makeTempProject(t)
+	cfg := testConfig(t)
+	cfg.Artifacts.Root = filepath.Join(t.TempDir(), "artifacts")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	result, err := New(Options{
+		Config:        cfg,
+		JSONGenerator: scenarioGenerator(),
+	}).Run(context.Background(), RunRequest{
+		ProjectID: "project-target-start",
+		RepoPath:  projectRoot,
+		TargetConfig: &config.TargetConfig{
+			BaseURL: server.URL,
+			Commands: config.TargetCommands{
+				Start: targetNoopCommand(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status == workflow.StatusFailed {
+		t.Fatalf("expected target startup to avoid workflow failure, got %s", result.Status)
+	}
 }
 
 func TestOrchestratorFailsWhenAgentExecutorFails(t *testing.T) {
@@ -502,6 +581,10 @@ func testConfig(t *testing.T) config.Config {
 	cfg.Runner.PlaywrightRunnerDir = filepath.Join(repoRoot(t), "runner", "playwright")
 	cfg.Database.DSN = filepath.Join(t.TempDir(), "autotest.db")
 	return cfg
+}
+
+func targetNoopCommand() string {
+	return "sleep 30"
 }
 
 func repoRoot(t *testing.T) string {

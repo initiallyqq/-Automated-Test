@@ -82,6 +82,12 @@ func NewGraphRunner(opts Options) (*GraphRunner, error) {
 }
 
 func (gr *GraphRunner) Run(ctx context.Context, req RunRequest, taskID string) (workflow.State, error) {
+	var err error
+	req, err = gr.orch.prepareRunRequest(req)
+	if err != nil {
+		return workflow.State{}, err
+	}
+	defer gr.orch.stopTargetApp()
 	ws := workflow.NewState(taskID, req.ProjectID, gr.orch.config.Patch.MaxTestFixRetry)
 	ws.RepoVersion = "local"
 	if gr.orch.repo != nil {
